@@ -428,9 +428,9 @@ def main():
         for param in trainable_parameters:
             set_requires_grad(param, True)
         
-        _logger.info('Trainable Paramaters: {}'.format(
-            [name for name, param in model.named_parameters() if param.requires_grad])
-        )
+    _logger.info('Trainable Paramaters: {}'.format(
+        [name for name, param in model.named_parameters() if param.requires_grad])
+    )
         # pdb.set_trace()
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'

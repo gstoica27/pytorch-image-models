@@ -35,6 +35,7 @@ def create_model(
         scriptable=None,
         exportable=None,
         no_jit=None,
+        strict=True,
         **kwargs):
     """Create a model
 
@@ -71,6 +72,6 @@ def create_model(
         model = create_fn(pretrained=pretrained, pretrained_cfg=pretrained_cfg, **kwargs)
 
     if checkpoint_path:
-        load_checkpoint(model, checkpoint_path)
+        load_checkpoint(model, checkpoint_path, strict=strict)
 
     return model
