@@ -179,17 +179,58 @@ default_cfgs = {
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., attention_type='normal'):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
+        self.head_dim = head_dim
 
+        self.attention_type = attention_type
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
+        if 'reverse' in self.attention_type:
+            self.activation = nn.GELU()
+            self.input_proj = nn.Linear(dim, dim)
+            self.weight_generator = nn.Linear(head_dim, head_dim * head_dim, bias=False)
+            self.reverse_parameters = [self.qkv, self.input_proj, self.weight_generator]
+            if self.attention_type == 'reverse':
+                self.bias_generator = nn.Linear(head_dim, head_dim, bias=False)
+                self.reverse_parameters.append(self.bias_generator)
+            elif self.attention_type == 'shared_forward_and_reverse':
+                self.expert_proj = nn.Linear(dim, dim)
+                self.reverse_parameters.append(self.expert_proj)
+        
+        self.attn_parameters = [self.qkv]
+        self.forward_parameters = [self.qkv]
+        self.layer_parameters = [self.proj]
+        
+    
+    def forward_normal(self, x, attn, v):
+        B, N, C = x.shape
+        return (attn @ v).transpose(1, 2).reshape(B, N, C)
+    
+    def forward_reverse(self, x, attn, v):
+        B, N, C = x.shape
+        x_proj = self.activation(self.input_proj(x).reshape(B, N, self.num_heads, self.head_dim, 1).transpose(2, 1))
+        if self.attention_type == 'reverse':
+            attn_operand = v
+        else:
+            attn_operand = self.expert_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(2, 1)
+        
+        experts = (attn.transpose(-2, -1) @ self.activation(attn_operand))
+        
+        weights = self.weight_generator(experts).reshape(B, self.num_heads, N, self.head_dim, self.head_dim)
+        output = (weights @ x_proj).squeeze(-1)
+        if self.attention_type == 'reverse':
+            biases = self.bias_generator(experts)
+            output = output + biases
+        output = output.transpose(2, 1).flatten(2)
+        return output
 
     def forward(self, x):
         B, N, C = x.shape
@@ -199,8 +240,16 @@ class Attention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        
+        if self.attention_type == 'normal':
+            x = self.forward_normal(x, attn, v)
+        elif self.attention_type == 'reverse':
+            x = self.forward_reverse(x, attn, v)
+        elif self.attention_type == 'shared_forward_and_reverse':
+            normal_output = self.forward_normal(x, attn, v)
+            reverse_output = self.forward_reverse(x, attn, v)
+            x = normal_output + reverse_output
+        
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -220,10 +269,14 @@ class Block(nn.Module):
 
     def __init__(
             self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., init_values=None,
-            drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+            drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, attention_type='normal'):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, 
+            attn_drop=attn_drop, proj_drop=drop, 
+            attention_type=attention_type
+        )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -233,6 +286,8 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.block_parameters = [self.norm1, self.ls1, self.norm2, self.mlp, self.ls2]
 
     def forward(self, x):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
@@ -244,7 +299,7 @@ class ParallelBlock(nn.Module):
 
     def __init__(
             self, dim, num_heads, num_parallel=2, mlp_ratio=4., qkv_bias=False, init_values=None,
-            drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+            drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, attention_type='normal'):
         super().__init__()
         self.num_parallel = num_parallel
         self.attns = nn.ModuleList()
@@ -252,7 +307,7 @@ class ParallelBlock(nn.Module):
         for _ in range(num_parallel):
             self.attns.append(nn.Sequential(OrderedDict([
                 ('norm', norm_layer(dim)),
-                ('attn', Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)),
+                ('attn', Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, attention_type=attention_type)),
                 ('ls', LayerScale(dim, init_values=init_values) if init_values else nn.Identity()),
                 ('drop_path', DropPath(drop_path) if drop_path > 0. else nn.Identity())
             ])))
@@ -292,7 +347,8 @@ class VisionTransformer(nn.Module):
             self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, global_pool='token',
             embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None,
             drop_rate=0., attn_drop_rate=0., drop_path_rate=0., weight_init='', init_values=None,
-            embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block):
+            embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block, attention_type='normal',
+            injection_blocks=-1):
         """
         Args:
             img_size (int, tuple): input image size
@@ -338,7 +394,9 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.Sequential(*[
             block_fn(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, init_values=init_values,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
+                attention_type=attention_type if (injection_blocks != -1 and i in injection_blocks) else 'normal'
+                )
             for i in range(depth)])
         use_fc_norm = self.global_pool == 'avg'
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()

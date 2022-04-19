@@ -15,6 +15,7 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
+from asyncio.log import logger
 import time
 import yaml
 import os
@@ -303,6 +304,24 @@ parser.add_argument('--use-multi-epochs-loader', action='store_true', default=Fa
 parser.add_argument('--log-wandb', action='store_true', default=False,
                     help='log training and validation metrics to wandb')
 
+# Continual Learning Parameters
+parser.add_argument('--attention_type', default='normal')
+parser.add_argument('--injection_blocks', nargs='+', type=int, default=-1)
+parser.add_argument('--continue_learning', action='store_true', default=False)
+parser.add_argument('--freeze_baseline_parameters', action='store_true', default=False)
+parser.add_argument('--train_parameters', default='block')
+parser.add_argument('--stop_epoch', default=150)
+parser.add_argument('--stop_diff', default=.1)
+parser.add_argument('--not_strict', action='store_true', default=False)
+
+def set_requires_grad(m, requires_grad):
+    # from https://discuss.pytorch.org/t/requires-grad-doesnt-propagate-to-the-parameters-of-the-module/9979/6
+    if hasattr(m, 'weight') and m.weight is not None:
+        m.weight.requires_grad_(requires_grad)
+    if hasattr(m, 'bias') and m.bias is not None:
+        m.bias.requires_grad_(requires_grad)
+    else:
+        m.requires_grad_(requires_grad)
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -372,6 +391,8 @@ def main():
     if args.fuser:
         set_jit_fuser(args.fuser)
 
+    logger.info('Print strict: {}'.format(args.not_strict))
+
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -384,7 +405,33 @@ def main():
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
-        checkpoint_path=args.initial_checkpoint)
+        checkpoint_path=args.initial_checkpoint,
+        attention_type=args.attention_type,
+        injection_blocks=args.injection_blocks,
+        strict=not args.not_strict)
+    
+    print(model)
+    if args.continue_learning and args.freeze_baseline_parameters:
+        # import pdb; pdb.set_trace()
+        for param in model.parameters(): param.requires_grad = False
+        trainable_parameters = []
+        # pdb.set_trace()
+        for injection_block in args.injection_blocks:
+            block = model.blocks[injection_block]
+            if 'reverse' in args.attention_type:
+                trainable_parameters += block.attn.reverse_parameters + block.attn.layer_parameters
+            if args.attention_type == 'shared_forward_and_reverse':
+                trainable_parameters += block.attn.forward_parameters
+            if args.train_parameters == 'block':
+                trainable_parameters += block.block_parameters
+        
+        for param in trainable_parameters:
+            set_requires_grad(param, True)
+        
+        _logger.info('Trainable Paramaters: {}'.format(
+            [name for name, param in model.named_parameters() if param.requires_grad])
+        )
+        # pdb.set_trace()
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
@@ -658,6 +705,9 @@ def main():
                 # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+            
+            if args.continue_learning:
+                if args.stop_epoch <= epoch: break
 
     except KeyboardInterrupt:
         pass
